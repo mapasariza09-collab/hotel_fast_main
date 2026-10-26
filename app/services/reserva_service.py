@@ -1,0 +1,1170 @@
+"""Reglas de negocio de reservas: disponibilidad, creación, edición y consulta.
+
+El código de reserva se genera con el formato `RES-{año}-{secuencial de 6 dígitos}`
+donde el año viene de hoy en Bogotá. La unicidad la garantiza el constraint
+UNIQUE de `reservas.codigo`; ante una colisión se recalcula y se reintenta.
+"""
+
+import re
+from collections.abc import Callable
+from datetime import date
+from decimal import Decimal
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.errors import (
+    ConflictoError,
+    NoEncontradoError,
+    ReglaNegocioError,
+    ValidacionError,
+)
+from app.core.pagination import paginar_consulta
+from app.core.tiempo import ahora_utc
+from app.models import (
+    EstadoHabitacion,
+    EstadoLimpieza,
+    EstadoReserva,
+    Habitacion,
+    Huesped,
+    Reserva,
+    TipoHabitacion,
+)
+from app.schemas.huesped import HuespedResumen
+from app.schemas.reserva import (
+    CancelarReservaRequest,
+    CheckOutRead,
+    ExtenderReservaRequest,
+    HabitacionResumen,
+    ReservaCreate,
+    ReservaFiltros,
+    ReservaRead,
+    ReservaUpdate,
+)
+from app.services import auditoria_service, cuenta_service
+
+PATRON_CODIGO = re.compile(r"^RES-(\d{4})-(\d+)$")
+MAX_INTENTOS_CODIGO = 5
+ANCHO_SECUENCIAL = 6
+
+# Estados que ocupan el rango de la reserva: coinciden con el WHERE de la
+# restriccion ex_reservas_solapamiento. CHECK_OUT, CANCELADA y NO_SHOW no bloquean.
+ESTADOS_QUE_BLOQUEAN = (
+    EstadoReserva.PENDIENTE,
+    EstadoReserva.CONFIRMADA,
+    EstadoReserva.CHECK_IN,
+)
+# Estados en los que la reserva todavia puede editarse.
+ESTADOS_EDITABLES = (EstadoReserva.PENDIENTE, EstadoReserva.CONFIRMADA)
+
+# Transiciones de estado permitidas (clave = estado origen, valor = set de destinos).
+TRANSICIONES_VALIDAS = {
+    EstadoReserva.PENDIENTE: {EstadoReserva.CONFIRMADA, EstadoReserva.CANCELADA},
+    EstadoReserva.CONFIRMADA: {
+        EstadoReserva.CANCELADA,
+        EstadoReserva.NO_SHOW,
+        EstadoReserva.CHECK_IN,
+    },
+    EstadoReserva.CHECK_IN: {EstadoReserva.CHECK_OUT},
+}
+
+# Intentos máximos para realinear la habitación bloqueada con la de la reserva
+# cuando esta cambia entre la lectura inicial y el bloqueo.
+MAX_INTENTOS_BLOQUEO = 3
+
+# Acciones de auditoría para cada transición de estado de una reserva.
+# Siguen la convención de verbo suelto usada en el resto del proyecto
+# (CREATE/UPDATE en reservas, ANULAR en consumos y pagos).
+ACCION_CONFIRMAR_RESERVA = "CONFIRMAR"
+ACCION_CANCELAR_RESERVA = "CANCELAR"
+ACCION_NO_SHOW_RESERVA = "NO_SHOW"
+ACCION_CHECK_IN_RESERVA = "CHECK_IN"
+ACCION_CHECK_OUT_RESERVA = "CHECK_OUT"
+ACCION_EXTENDER_RESERVA = "EXTENDER"
+ACCION_LIMPIEZA_HABITACION = "LIMPIEZA"
+
+
+class TransicionInvalidaError(ReglaNegocioError):
+    codigo = "TRANSICION_INVALIDA"
+
+    def __init__(self, estado_actual: EstadoReserva, estado_pedido: EstadoReserva) -> None:
+        super().__init__(
+            f"Transicion invalida: de {estado_actual.value} a {estado_pedido.value}"
+        )
+
+
+class NoShowAntesDeFechaError(ReglaNegocioError):
+    codigo = "NO_SHOW_ANTES_DE_FECHA"
+
+    def __init__(self, fecha_entrada: date) -> None:
+        super().__init__(
+            f"No se puede marcar NO_SHOW antes de la fecha de entrada ({fecha_entrada.isoformat()})"
+        )
+
+
+class ReservaNoEncontradaError(NoEncontradoError):
+    codigo = "RESERVA_NO_ENCONTRADA"
+
+    def __init__(self) -> None:
+        super().__init__("No se encontro la reserva")
+
+
+class HuespedNoEncontradoError(NoEncontradoError):
+    codigo = "HUESPED_NO_ENCONTRADO"
+
+    def __init__(self) -> None:
+        super().__init__("No se encontro el huesped")
+
+
+class HabitacionNoEncontradaError(NoEncontradoError):
+    codigo = "HABITACION_NO_ENCONTRADA"
+
+    def __init__(self) -> None:
+        super().__init__("No se encontro la habitacion")
+
+
+class HabitacionInactivaError(ReglaNegocioError):
+    codigo = "HABITACION_INACTIVA"
+
+    def __init__(self) -> None:
+        super().__init__("La habitacion no esta activa para recibir reservas")
+
+
+class HabitacionNoListaError(ReglaNegocioError):
+    codigo = "HABITACION_NO_LISTA"
+
+    def __init__(self, motivo: str) -> None:
+        super().__init__(f"La habitacion {motivo} y no puede recibir el check-in")
+
+
+class CapacidadExcedidaError(ConflictoError):
+    codigo = "CAPACIDAD_EXCEDIDA"
+
+    def __init__(self, capacidad: int, solicitados: int) -> None:
+        super().__init__(
+            f"La habitacion tiene capacidad para {capacidad} huespedes "
+            f"y se solicitan {solicitados}"
+        )
+
+
+class ReservaSolapadaError(ConflictoError):
+    codigo = "RESERVA_SOLAPADA"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "La habitacion ya tiene una reserva que se solapa con el rango indicado"
+        )
+
+
+class RangoFechasInvalidoError(ReglaNegocioError):
+    codigo = "RANGO_FECHAS_INVALIDO"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "La fecha de salida debe ser posterior a la fecha de entrada"
+        )
+
+
+class EntradaEnPasadoError(ReglaNegocioError):
+    codigo = "ENTRADA_EN_PASADO"
+
+    def __init__(self, hoy: date) -> None:
+        super().__init__(
+            f"La fecha de entrada no puede ser anterior a hoy ({hoy.isoformat()})"
+        )
+
+
+class CheckinAntesDeFechaError(ReglaNegocioError):
+    codigo = "CHECKIN_ANTES_DE_FECHA"
+
+    def __init__(self, fecha_entrada: date, hoy: date) -> None:
+        super().__init__(
+            f"El check-in no puede hacerse antes de la fecha de entrada "
+            f"({fecha_entrada.isoformat()}); hoy es {hoy.isoformat()}"
+        )
+
+
+class EstanciaVencidaError(ReglaNegocioError):
+    codigo = "ESTANCIA_VENCIDA"
+
+    def __init__(self, fecha_salida: date) -> None:
+        super().__init__(
+            f"La estancia ya vencio: la fecha de salida es {fecha_salida.isoformat()}"
+        )
+
+
+class ReservaNoEditableError(ReglaNegocioError):
+    codigo = "RESERVA_NO_EDITABLE"
+
+    def __init__(self, estado: EstadoReserva) -> None:
+        super().__init__(
+            f"La reserva no es editable en estado {estado.value}"
+        )
+
+
+class CodigoReservaNoDisponibleError(ConflictoError):
+    codigo = "CODIGO_RESERVA_NO_DISPONIBLE"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No se pudo generar un codigo de reserva unico, intente de nuevo"
+        )
+
+
+class RangoDeFiltrosInvalidoError(ValidacionError):
+    codigo = "RANGO_FILTROS_INVALIDO"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "La fecha desde no puede ser posterior a la fecha hasta",
+            errors=[],
+        )
+
+
+def _habitacion_para_reserva(db: Session, habitacion_id: int) -> Habitacion:
+    """Lee la habitacion bloqueando la fila (SELECT FOR UPDATE en PostgreSQL).
+
+    En SQLite el bloqueo se ignora sin fallar; la unicidad y el no solapamiento
+    se apoyan ademas en el constraint UNIQUE de `reservas.codigo` y en la
+    comprobacion previa de solapamiento.
+    """
+    habitacion = db.get(Habitacion, habitacion_id, with_for_update=True)
+    if habitacion is None:
+        raise HabitacionNoEncontradaError
+    return habitacion
+
+
+def _validar_transicion(reserva: Reserva, destino: EstadoReserva) -> None:
+    """Valida que `reserva` pueda pasar a `destino`.
+
+    Lanza TransicionInvalidaError si la transición no está permitida desde el
+    estado actual de la reserva.
+    """
+    destinos = TRANSICIONES_VALIDAS.get(reserva.estado)
+    if destinos is None or destino not in destinos:
+        raise TransicionInvalidaError(reserva.estado, destino)
+
+
+def _recargar_reserva_bloqueada(db: Session, reserva_id: int) -> Reserva | None:
+    """Relee la reserva con SELECT FOR UPDATE y refresca el objeto ya cargado.
+
+    `populate_existing` fuerza a sobrescribir los atributos del objeto del identity
+    map con los de la fila recién leída. Sin esto, un `db.get()` previo deja el
+    estado viejo en memoria y la validación se haría sobre datos obsoletos.
+    """
+    return db.execute(
+        select(Reserva)
+        .where(Reserva.id == reserva_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+
+
+def _bloquear_habitacion_de_reserva(
+    db: Session,
+    reserva: Reserva,
+    habitacion_adicional_id: int | None = None,
+) -> dict[int, Habitacion]:
+    """Bloquea las habitaciones implicadas y fija la reserva con SELECT FOR UPDATE.
+
+    Orden de bloqueo: en la primera pasada las habitaciones se bloquean por
+    `habitacion.id` ascendente, y siempre habitación antes que reserva. Ese orden
+    total y estable es lo que evita deadlocks: dos peticiones que se crucen (mover la
+    reserva A->B y a la vez B->A) terminan tomando los mismos bloqueos en la misma
+    secuencia, así que una espera a la otra en vez de formarse un ciclo. Por eso la
+    habitación destino de un PUT se bloquea junto con la actual en este mismo paso, y
+    no después.
+
+    Excepción acotada: si la reserva cambia de habitación mientras se bloquea, el
+    reintento puede tomar una habitación con id menor que otra ya retenida, porque los
+    bloqueos adquiridos no se sueltan. Es una carrera muy improbable y está acotada
+    por MAX_INTENTOS_BLOQUEO; en PostgreSQL un deadlock lo resolvería abortando una
+    de las dos transacciones.
+
+    `habitacion_adicional_id` es la habitación destino de un cambio; si es None solo
+    se bloquea la actual. El valor devuelto son las habitaciones bloqueadas, indexadas
+    por id, para que el llamante use las que necesite.
+
+    Cuando esta función devuelve, la reserva permanece bloqueada hasta el commit, de
+    modo que las reglas se validan sobre el estado real y no sobre un estado viejo
+    que otra petición pudiera cambiar entre la validación y el commit.
+    """
+    pendientes = {reserva.habitacion_id}
+    if habitacion_adicional_id is not None:
+        pendientes.add(habitacion_adicional_id)
+
+    bloqueadas: dict[int, Habitacion] = {}
+    for _intento in range(MAX_INTENTOS_BLOQUEO):
+        # sorted() garantiza el orden ascendente por id en cada intento.
+        for habitacion_id in sorted(pendientes):
+            if habitacion_id not in bloqueadas:
+                bloqueadas[habitacion_id] = _habitacion_para_reserva(db, habitacion_id)
+
+        reserva_fijada = _recargar_reserva_bloqueada(db, reserva.id)
+        if reserva_fijada is None:
+            raise ReservaNoEncontradaError
+        if reserva_fijada.habitacion_id in bloqueadas:
+            return bloqueadas
+
+        # La reserva cambió de habitación mientras bloqueábamos: se añade la nueva al
+        # conjunto. Los bloqueos ya adquiridos se conservan, así que no se vuelven a
+        # tomar y la habitación nueva puede quedar por debajo de una ya retenida.
+        pendientes.add(reserva_fijada.habitacion_id)
+
+    raise ConflictoError(
+        "La habitacion de la reserva cambio mientras se bloqueaba; reintenta"
+    )
+
+
+def _es_activa(habitacion: Habitacion) -> bool:
+    return habitacion.estado != EstadoHabitacion.MANTENIMIENTO
+
+
+def _existe_solapamiento(
+    db: Session,
+    habitacion_id: int,
+    fecha_entrada: date,
+    fecha_salida: date,
+    *,
+    excluir_reserva_id: int | None = None,
+) -> bool:
+    """Indica si el rango [entrada, salida) se solapa con alguna reserva activa.
+
+    El intervalo es semiabierto: una salida el mismo dia que otra entrada
+    no se considera solapamiento.
+    """
+    consulta = select(Reserva.id).where(
+        Reserva.habitacion_id == habitacion_id,
+        Reserva.estado.in_(ESTADOS_QUE_BLOQUEAN),
+        Reserva.fecha_entrada < fecha_salida,
+        Reserva.fecha_salida > fecha_entrada,
+    )
+    if excluir_reserva_id is not None:
+        consulta = consulta.where(Reserva.id != excluir_reserva_id)
+    return db.scalar(consulta.limit(1)) is not None
+
+
+def _numero_noches(fecha_entrada: date, fecha_salida: date) -> int:
+    return (fecha_salida - fecha_entrada).days
+
+
+def _total_estimado(precio_noche: Decimal, noches: int) -> Decimal:
+    return precio_noche * noches
+
+
+def siguiente_numero_codigo(db: Session, anio: int) -> int:
+    """Numero siguiente para `RES-{anio}-`, a partir del ultimo codigo existente.
+
+    Se ordena por longitud y luego alfabeticamente para tolerar codigos con
+    distinto ancho; el numero se interpreta en Python. Si no hay filas, o el
+    ultimo codigo no sigue el formato, se reinicia en 1.
+    """
+    ultimo = db.scalar(
+        select(Reserva.codigo)
+        .where(Reserva.codigo.like(f"RES-{anio}-%"))
+        .order_by(func.length(Reserva.codigo).desc(), Reserva.codigo.desc())
+        .limit(1)
+    )
+    if ultimo is None:
+        return 1
+    coincidencia = PATRON_CODIGO.match(ultimo)
+    if coincidencia is None or int(coincidencia.group(1)) != anio:
+        return 1
+    return int(coincidencia.group(2)) + 1
+
+
+def generar_codigo(db: Session, anio: int) -> str:
+    numero = siguiente_numero_codigo(db, anio)
+    return f"RES-{anio}-{numero:0{ANCHO_SECUENCIAL}d}"
+
+
+def _armar_lectura(
+    reserva: Reserva, huesped: Huesped, habitacion: Habitacion
+) -> ReservaRead:
+    return ReservaRead(
+        id=reserva.id,
+        codigo=reserva.codigo,
+        huesped=HuespedResumen.model_validate(huesped),
+        habitacion=HabitacionResumen.model_validate(habitacion),
+        fecha_entrada=reserva.fecha_entrada,
+        fecha_salida=reserva.fecha_salida,
+        numero_huespedes=reserva.numero_huespedes,
+        estado=reserva.estado,
+        precio_noche_aplicado=reserva.precio_noche_aplicado,
+        total_estimado=reserva.total_estimado,
+        observaciones=reserva.observaciones,
+        motivo_cancelacion=reserva.motivo_cancelacion,
+        check_in_real=reserva.check_in_real,
+        check_out_real=reserva.check_out_real,
+        creada_por=reserva.creada_por,
+        created_at=reserva.created_at,
+        updated_at=reserva.updated_at,
+    )
+
+
+def _armar_lecturas(db: Session, reservas: list[Reserva]) -> list[ReservaRead]:
+    """Construye las lecturas resolviendo huesped y habitacion en dos consultas."""
+    if not reservas:
+        return []
+    huespedes = {
+        huesped.id: huesped
+        for huesped in db.scalars(
+            select(Huesped).where(
+                Huesped.id.in_({reserva.huesped_id for reserva in reservas})
+            )
+        ).all()
+    }
+    habitaciones = {
+        habitacion.id: habitacion
+        for habitacion in db.scalars(
+            select(Habitacion).where(
+                Habitacion.id.in_({reserva.habitacion_id for reserva in reservas})
+            )
+        ).all()
+    }
+    return [
+        _armar_lectura(
+            reserva,
+            huespedes[reserva.huesped_id],
+            habitaciones[reserva.habitacion_id],
+        )
+        for reserva in reservas
+    ]
+
+
+def consultar_disponibilidad(
+    db: Session,
+    *,
+    entrada: date,
+    salida: date,
+    huespedes: int = 1,
+    tipo: TipoHabitacion | None = None,
+) -> list[HabitacionResumen]:
+    """Habitaciones activas libres para el rango semiabierto [entrada, salida)."""
+    if salida <= entrada:
+        raise RangoFechasInvalidoError
+
+    ocupadas = (
+        select(Reserva.habitacion_id)
+        .where(
+            Reserva.estado.in_(ESTADOS_QUE_BLOQUEAN),
+            Reserva.fecha_entrada < salida,
+            Reserva.fecha_salida > entrada,
+        )
+        .distinct()
+    )
+    consulta = (
+        select(Habitacion)
+        .where(
+            Habitacion.estado != EstadoHabitacion.MANTENIMIENTO,
+            Habitacion.capacidad >= huespedes,
+            Habitacion.id.not_in(ocupadas),
+        )
+        .order_by(Habitacion.numero)
+    )
+    if tipo is not None:
+        consulta = consulta.where(Habitacion.tipo == tipo)
+
+    habitaciones = list(db.scalars(consulta).all())
+    return [HabitacionResumen.model_validate(habitacion) for habitacion in habitaciones]
+
+
+def crear_reserva(
+    db: Session,
+    datos: ReservaCreate,
+    usuario_id: int,
+    hoy: date,
+) -> ReservaRead:
+    """Crea la reserva en PENDIENTE con el precio de la habitacion congelado.
+
+    El precio_noche_aplicado se toma de la tarifa vigente al momento de crear y
+    el total_estimado es noches × precio_noche_aplicado.
+    """
+    if datos.fecha_salida <= datos.fecha_entrada:
+        raise RangoFechasInvalidoError
+    if datos.fecha_entrada < hoy:
+        raise EntradaEnPasadoError(hoy)
+
+    huesped = db.get(Huesped, datos.huesped_id)
+    if huesped is None:
+        raise HuespedNoEncontradoError
+
+    habitacion = _habitacion_para_reserva(db, datos.habitacion_id)
+    if not _es_activa(habitacion):
+        raise HabitacionInactivaError
+    if habitacion.capacidad < datos.numero_huespedes:
+        raise CapacidadExcedidaError(habitacion.capacidad, datos.numero_huespedes)
+    if _existe_solapamiento(
+        db, habitacion.id, datos.fecha_entrada, datos.fecha_salida
+    ):
+        raise ReservaSolapadaError
+
+    noches = _numero_noches(datos.fecha_entrada, datos.fecha_salida)
+    total_estimado = _total_estimado(habitacion.precio_por_noche, noches)
+
+    reserva = _insertar_con_codigo_unico(
+        db,
+        anio=hoy.year,
+        huesped_id=datos.huesped_id,
+        habitacion_id=datos.habitacion_id,
+        fecha_entrada=datos.fecha_entrada,
+        fecha_salida=datos.fecha_salida,
+        numero_huespedes=datos.numero_huespedes,
+        precio_noche_aplicado=habitacion.precio_por_noche,
+        total_estimado=total_estimado,
+        observaciones=datos.observaciones,
+        usuario_id=usuario_id,
+    )
+    return _armar_lectura(reserva, huesped, habitacion)
+
+
+def _insertar_con_codigo_unico(
+    db: Session,
+    *,
+    anio: int,
+    huesped_id: int,
+    habitacion_id: int,
+    fecha_entrada: date,
+    fecha_salida: date,
+    numero_huespedes: int,
+    precio_noche_aplicado: Decimal,
+    total_estimado: Decimal,
+    observaciones: str | None,
+    usuario_id: int,
+) -> Reserva:
+    """Inserta la reserva reintentando el codigo ante colisiones.
+
+    Cada intento usa un savepoint. Si salta un IntegrityError se deshace el
+    savepoint y se vuelve a comprobar el solapamiento: si ahora hay solapamiento
+    la causa es la restriccion de exclusion (RESERVA_SOLAPADA); si no, es una
+    colision de codigo y se recalcula para reintentar.
+    """
+    for intento in range(1, MAX_INTENTOS_CODIGO + 1):
+        reserva = Reserva(
+            codigo=generar_codigo(db, anio),
+            huesped_id=huesped_id,
+            habitacion_id=habitacion_id,
+            fecha_entrada=fecha_entrada,
+            fecha_salida=fecha_salida,
+            numero_huespedes=numero_huespedes,
+            estado=EstadoReserva.PENDIENTE,
+            precio_noche_aplicado=precio_noche_aplicado,
+            total_estimado=total_estimado,
+            observaciones=observaciones,
+            creada_por=usuario_id,
+        )
+        savepoint = db.begin_nested()
+        try:
+            db.add(reserva)
+            db.flush()
+            savepoint.commit()
+        except IntegrityError as error:
+            savepoint.rollback()
+            if _existe_solapamiento(
+                db, habitacion_id, fecha_entrada, fecha_salida
+            ):
+                raise ReservaSolapadaError from error
+            if intento == MAX_INTENTOS_CODIGO:
+                raise CodigoReservaNoDisponibleError from error
+            continue
+        db.commit()
+        db.refresh(reserva)
+        return reserva
+
+    raise CodigoReservaNoDisponibleError
+
+
+def listar_reservas(db: Session, filtros: ReservaFiltros) -> tuple[list[ReservaRead], int]:
+    """Lista reservas filtradas y paginadas, de la entrada mas reciente a la antigua."""
+    if (
+        filtros.desde is not None
+        and filtros.hasta is not None
+        and filtros.desde > filtros.hasta
+    ):
+        raise RangoDeFiltrosInvalidoError
+
+    consulta = select(Reserva)
+    if filtros.estado is not None:
+        consulta = consulta.where(Reserva.estado == filtros.estado)
+    if filtros.habitacion_id is not None:
+        consulta = consulta.where(Reserva.habitacion_id == filtros.habitacion_id)
+    if filtros.huesped_id is not None:
+        consulta = consulta.where(Reserva.huesped_id == filtros.huesped_id)
+    if filtros.desde is not None:
+        consulta = consulta.where(Reserva.fecha_entrada >= filtros.desde)
+    if filtros.hasta is not None:
+        consulta = consulta.where(Reserva.fecha_entrada <= filtros.hasta)
+
+    total = db.scalar(select(func.count()).select_from(consulta.subquery())) or 0
+    reservas = list(
+        db.scalars(
+            paginar_consulta(
+                consulta.order_by(Reserva.fecha_entrada.desc(), Reserva.id.desc()),
+                pagina=filtros.pagina,
+                tamano=filtros.tamano,
+            )
+        ).all()
+    )
+    return _armar_lecturas(db, reservas), total
+
+
+def obtener_reserva(db: Session, reserva_id: int) -> ReservaRead:
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+    return _armar_lecturas(db, [reserva])[0]
+
+
+def actualizar_reserva(
+    db: Session,
+    reserva_id: int,
+    datos: ReservaUpdate,
+    usuario_id: int,
+    hoy: date,
+) -> ReservaRead:
+    """Actualiza una reserva editable.
+
+    Solo se admiten los estados PENDIENTE y CONFIRMADA. Se revalidan huesped,
+    habitacion, capacidad y solapamiento excluyendo la propia reserva.
+
+    La entrada no puede quedar en el pasado, pero ese chequeo solo aplica cuando
+    la fecha de entrada cambia de verdad: una reserva ya iniciada se puede
+    seguir editando (observaciones, huespedes) y reenviar su entrada original,
+    aunque ya sea anterior a hoy.
+
+    Si cambian las fechas o la habitacion, el precio_noche_aplicado se vuelve a
+    congelar con la tarifa vigente en ese momento (no se conserva el precio
+    original) y el total_estimado se recalcula como noches × precio_noche_aplicado.
+    Si solo cambian el huesped, los huespedes o las observaciones, el precio
+    congelado y el total se mantienen.
+
+    La reserva se lee sin bloqueo solo para conocer qué habitaciones bloquear; la
+    fila de la reserva y las habitaciones quedan bloqueadas antes de validar nada,
+    de modo que la edición no compite con una transición concurrente.
+    """
+    # (a) Lectura sin bloqueo: solo para conocer las habitaciones implicadas.
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear, en orden ascendente por id, la habitación actual y la
+    # destino si el PUT la cambia, y fijar la reserva con SELECT FOR UPDATE.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva, datos.habitacion_id)
+
+    # (e) Validar con la reserva bloqueada y con los bloqueos ya tomados.
+    if reserva.estado not in ESTADOS_EDITABLES:
+        raise ReservaNoEditableError(reserva.estado)
+
+    fecha_entrada = datos.fecha_entrada or reserva.fecha_entrada
+    fecha_salida = datos.fecha_salida or reserva.fecha_salida
+    numero_huespedes = datos.numero_huespedes or reserva.numero_huespedes
+    habitacion_id = datos.habitacion_id or reserva.habitacion_id
+
+    if fecha_salida <= fecha_entrada:
+        raise RangoFechasInvalidoError
+    if (
+        datos.fecha_entrada is not None
+        and datos.fecha_entrada != reserva.fecha_entrada
+        and fecha_entrada < hoy
+    ):
+        raise EntradaEnPasadoError(hoy)
+
+    huesped_id = datos.huesped_id or reserva.huesped_id
+    huesped = db.get(Huesped, huesped_id)
+    if huesped is None:
+        raise HuespedNoEncontradoError
+
+    # Si el PUT cambia de habitación, el destino ya está bloqueado junto con la
+    # actual, así que aquí se usa directamente el del PUT.
+    habitacion = habitaciones[habitacion_id]
+    if not _es_activa(habitacion):
+        raise HabitacionInactivaError
+    if habitacion.capacidad < numero_huespedes:
+        raise CapacidadExcedidaError(habitacion.capacidad, numero_huespedes)
+    if _existe_solapamiento(
+        db,
+        habitacion_id,
+        fecha_entrada,
+        fecha_salida,
+        excluir_reserva_id=reserva_id,
+    ):
+        raise ReservaSolapadaError
+
+    # Se calcula antes de mutar: depende de los valores recargados, no de los nuevos.
+    cambian_fechas_o_habitacion = (
+        fecha_entrada != reserva.fecha_entrada
+        or fecha_salida != reserva.fecha_salida
+        or habitacion_id != reserva.habitacion_id
+    )
+
+    if datos.huesped_id is not None:
+        reserva.huesped_id = datos.huesped_id
+    if datos.habitacion_id is not None:
+        reserva.habitacion_id = datos.habitacion_id
+    reserva.fecha_entrada = fecha_entrada
+    reserva.fecha_salida = fecha_salida
+    reserva.numero_huespedes = numero_huespedes
+    if datos.observaciones is not None:
+        reserva.observaciones = datos.observaciones
+
+    if cambian_fechas_o_habitacion:
+        noches = _numero_noches(fecha_entrada, fecha_salida)
+        reserva.precio_noche_aplicado = habitacion.precio_por_noche
+        reserva.total_estimado = _total_estimado(habitacion.precio_por_noche, noches)
+
+    try:
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise ReservaSolapadaError from error
+    db.refresh(reserva)
+    return _armar_lectura(reserva, huesped, habitacion)
+
+
+def ejecutar_con_auditoria(
+    db: Session,
+    *,
+    mutar: Callable[[], None],
+    detalle: dict[str, object],
+    usuario_id: int,
+    accion: str,
+    entidad: str,
+    entidad_id: int,
+) -> None:
+    """Ejecuta `mutar` y registra la auditoría en una sola transacción.
+
+    Único punto donde se combinan las mutaciones con la auditoría de confirmar,
+    cancelar, no-show, check-in, check-out, extender y limpieza: si `mutar` o el
+    registro de auditoría fallan, se revierte todo y ningún cambio persiste.
+
+    `mutar` aplica las mutaciones de la operación (reserva, habitación o ambas)
+    sobre la sesión en curso; `detalle` es el contenido de la auditoría.
+    La auditoría se atribuye a `usuario_id` (el usuario autenticado que ejecuta
+    la acción), nunca a `reserva.creada_por`.
+    """
+    try:
+        mutar()
+        auditoria_service.registrar_auditoria(
+            db,
+            usuario_id=usuario_id,
+            accion=accion,
+            entidad=entidad,
+            entidad_id=entidad_id,
+            detalle=detalle,
+            commit=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _cambiar_estado_y_auditar(
+    db: Session,
+    reserva: Reserva,
+    habitacion: Habitacion,
+    destino: EstadoReserva,
+    accion: str,
+    usuario_id: int,
+    motivo: str | None = None,
+) -> ReservaRead:
+    """Cambia el estado de la reserva y registra la auditoría en una sola transacción.
+
+    Si el cambio o el registro de auditoría fallan, se revierte todo y la reserva
+    conserva su estado anterior.
+    """
+    estado_anterior = reserva.estado
+
+    def mutar() -> None:
+        reserva.estado = destino
+        if motivo is not None:
+            reserva.motivo_cancelacion = motivo
+
+    ejecutar_con_auditoria(
+        db,
+        mutar=mutar,
+        detalle={
+            "estado_anterior": estado_anterior.value,
+            "estado_nuevo": destino.value,
+        },
+        usuario_id=usuario_id,
+        accion=accion,
+        entidad="Reserva",
+        entidad_id=reserva.id,
+    )
+
+    db.refresh(reserva)
+    huesped = db.get(Huesped, reserva.huesped_id)
+    return _armar_lectura(reserva, huesped, habitacion)
+
+
+def confirmar_reserva(
+    db: Session,
+    reserva_id: int,
+    usuario_id: int,
+    hoy: date,
+) -> ReservaRead:
+    """Confirma una reserva PENDIENTE -> CONFIRMADA.
+
+    Revalida que la habitacion siga activa y que no haya solapamiento
+    (excluyendo la propia reserva). La entrada no puede ser anterior a hoy.
+
+    La transición se valida con la reserva ya bloqueada para no confirmar sobre un
+    estado que otra petición haya cambiado mientras tanto.
+    """
+    # (a) Lectura sin bloqueo: solo sirve para conocer la habitacion a bloquear.
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear la habitacion y fijar la reserva con SELECT FOR UPDATE.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva)
+    habitacion = habitaciones[reserva.habitacion_id]
+
+    # (e) Validar transición sobre el estado bloqueado y vigente.
+    _validar_transicion(reserva, EstadoReserva.CONFIRMADA)
+
+    # (g) Reglas propias de la confirmación.
+    if not _es_activa(habitacion):
+        raise HabitacionInactivaError
+
+    if _existe_solapamiento(
+        db,
+        habitacion.id,
+        reserva.fecha_entrada,
+        reserva.fecha_salida,
+        excluir_reserva_id=reserva.id,
+    ):
+        raise ReservaSolapadaError
+
+    # El mismo día SÍ se permite.
+    if reserva.fecha_entrada < hoy:
+        raise EntradaEnPasadoError(hoy)
+
+    # (h) Cambio de estado y auditoría en una sola transacción.
+    return _cambiar_estado_y_auditar(
+        db,
+        reserva,
+        habitacion,
+        EstadoReserva.CONFIRMADA,
+        ACCION_CONFIRMAR_RESERVA,
+        usuario_id,
+    )
+
+
+def cancelar_reserva(
+    db: Session,
+    reserva_id: int,
+    datos: CancelarReservaRequest,
+    usuario_id: int,
+) -> ReservaRead:
+    """Cancela una reserva PENDIENTE|CONFIRMADA -> CANCELADA.
+
+    Guarda el motivo en motivo_cancelacion. La habitación queda libre.
+    """
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear la habitacion y fijar la reserva con SELECT FOR UPDATE.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva)
+    habitacion = habitaciones[reserva.habitacion_id]
+
+    # (e) Validar transición sobre el estado bloqueado y vigente.
+    _validar_transicion(reserva, EstadoReserva.CANCELADA)
+
+    # Motivo ya viene validado y stripeado por el schema
+    motivo = datos.motivo
+
+    return _cambiar_estado_y_auditar(
+        db,
+        reserva,
+        habitacion,
+        EstadoReserva.CANCELADA,
+        ACCION_CANCELAR_RESERVA,
+        usuario_id,
+        motivo=motivo,
+    )
+
+
+def no_show_reserva(
+    db: Session,
+    reserva_id: int,
+    usuario_id: int,
+    hoy: date,
+) -> ReservaRead:
+    """Marca una reserva CONFIRMADA -> NO_SHOW.
+
+    Solo se permite si hoy >= fecha_entrada. La habitación queda libre.
+    """
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear la habitacion y fijar la reserva con SELECT FOR UPDATE.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva)
+    habitacion = habitaciones[reserva.habitacion_id]
+
+    # (e) Validar transición PRIMERO, sobre el estado bloqueado y vigente.
+    _validar_transicion(reserva, EstadoReserva.NO_SHOW)
+
+    # (f) Solo después de la transición se evalúa la fecha de entrada.
+    if hoy < reserva.fecha_entrada:
+        raise NoShowAntesDeFechaError(reserva.fecha_entrada)
+
+    return _cambiar_estado_y_auditar(
+        db,
+        reserva,
+        habitacion,
+        EstadoReserva.NO_SHOW,
+        ACCION_NO_SHOW_RESERVA,
+        usuario_id,
+    )
+
+
+def _validar_habitacion_lista(habitacion: Habitacion) -> None:
+    """Exige que la habitación esté DISPONIBLE y LIMPIA para recibir un check-in.
+
+    El error usa un único código (HABITACION_NO_LISTA) pero nombra el motivo
+    concreto: en mantenimiento, ocupada o sucia.
+    """
+    if habitacion.estado is EstadoHabitacion.MANTENIMIENTO:
+        raise HabitacionNoListaError("esta en mantenimiento")
+    if habitacion.estado is not EstadoHabitacion.DISPONIBLE:
+        raise HabitacionNoListaError("esta ocupada")
+    if habitacion.limpieza is not EstadoLimpieza.LIMPIA:
+        raise HabitacionNoListaError("esta sucia")
+
+
+def check_in_reserva(
+    db: Session,
+    reserva_id: int,
+    usuario_id: int,
+    hoy: date,
+) -> ReservaRead:
+    """Registra el check-in de una reserva CONFIRMADA -> CHECK_IN.
+
+    La fecha de entrada no puede ser posterior a hoy y la estancia no puede
+    estar vencida (hoy < fecha_salida). La habitación debe estar DISPONIBLE y
+    LIMPIA. La reserva queda en CHECK_IN con `check_in_real` = ahora y la
+    habitación pasa a OCUPADA.
+
+    Igual que el resto de transiciones, la reserva y la habitación se bloquean
+    primero y todo se valida después, sobre el estado ya fijado con FOR UPDATE.
+    """
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear la habitacion y fijar la reserva con SELECT FOR UPDATE.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva)
+    habitacion = habitaciones[reserva.habitacion_id]
+
+    # (e) Validar transición sobre el estado bloqueado y vigente.
+    _validar_transicion(reserva, EstadoReserva.CHECK_IN)
+
+    # (g) Reglas propias del check-in.
+    if reserva.fecha_entrada > hoy:
+        raise CheckinAntesDeFechaError(reserva.fecha_entrada, hoy)
+    if hoy >= reserva.fecha_salida:
+        raise EstanciaVencidaError(reserva.fecha_salida)
+    _validar_habitacion_lista(habitacion)
+
+    estado_anterior = reserva.estado
+    habitacion_estado_anterior = habitacion.estado
+    limpieza_anterior = habitacion.limpieza
+    momento = ahora_utc()
+
+    def mutar() -> None:
+        reserva.estado = EstadoReserva.CHECK_IN
+        reserva.check_in_real = momento
+        habitacion.estado = EstadoHabitacion.OCUPADA
+
+    ejecutar_con_auditoria(
+        db,
+        mutar=mutar,
+        detalle={
+            "estado_anterior": estado_anterior.value,
+            "estado_nuevo": EstadoReserva.CHECK_IN.value,
+            "habitacion_estado_anterior": habitacion_estado_anterior.value,
+            "habitacion_estado_nuevo": EstadoHabitacion.OCUPADA.value,
+            "limpieza_anterior": limpieza_anterior.value,
+            "limpieza_nueva": limpieza_anterior.value,
+        },
+        usuario_id=usuario_id,
+        accion=ACCION_CHECK_IN_RESERVA,
+        entidad="Reserva",
+        entidad_id=reserva.id,
+    )
+
+    db.refresh(reserva)
+    db.refresh(habitacion)
+    huesped = db.get(Huesped, reserva.huesped_id)
+    return _armar_lectura(reserva, huesped, habitacion)
+
+
+def _con_resultado_economico(db: Session, lectura: ReservaRead) -> CheckOutRead:
+    """Completa la lectura de una reserva con el resultado de su cuenta.
+
+    El cálculo es siempre el de `cuenta_service.calcular_cuenta`: aquí solo se
+    suman sus campos para exponer total, pagado y saldo pendiente.
+    """
+    cuenta = cuenta_service.calcular_cuenta(db, lectura.id)
+    return CheckOutRead(
+        **lectura.model_dump(),
+        total_cuenta=cuenta.total_alojamiento + cuenta.total_consumos_vigentes,
+        total_pagado=cuenta.total_pagos_vigentes,
+        saldo_pendiente=cuenta.saldo_pendiente,
+    )
+
+
+def check_out_reserva(
+    db: Session,
+    reserva_id: int,
+    usuario_id: int,
+) -> CheckOutRead:
+    """Registra el check-out de una reserva CHECK_IN -> CHECK_OUT.
+
+    No cambia `fecha_salida` ni el total: lo facturado sigue siendo lo
+    reservado. La habitación queda SUCIA; si estaba OCUPADA pasa a DISPONIBLE y
+    si está en MANTENIMIENTO se respeta y no se cambia.
+
+    Devuelve `CheckOutRead`: la reserva leída de siempre más el resultado
+    económico de la cuenta (total, pagado y saldo pendiente), calculado con
+    `cuenta_service.calcular_cuenta`.
+
+    El check-out **no se bloquea por saldo pendiente**: el dominio no exige
+    saldo cero (decisión de negocio, no un olvido). El saldo se expone en la
+    respuesta para que recepción lo cobre o lo deje registrado.
+    """
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear la habitacion y fijar la reserva con SELECT FOR UPDATE.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva)
+    habitacion = habitaciones[reserva.habitacion_id]
+
+    # (e) Validar transición sobre el estado bloqueado y vigente.
+    _validar_transicion(reserva, EstadoReserva.CHECK_OUT)
+
+    estado_anterior = reserva.estado
+    habitacion_estado_anterior = habitacion.estado
+    limpieza_anterior = habitacion.limpieza
+    momento = ahora_utc()
+    habitacion_estado_nuevo = (
+        EstadoHabitacion.DISPONIBLE
+        if habitacion.estado is EstadoHabitacion.OCUPADA
+        else habitacion.estado
+    )
+
+    def mutar() -> None:
+        reserva.estado = EstadoReserva.CHECK_OUT
+        reserva.check_out_real = momento
+        habitacion.limpieza = EstadoLimpieza.SUCIA
+        if habitacion.estado is EstadoHabitacion.OCUPADA:
+            habitacion.estado = EstadoHabitacion.DISPONIBLE
+
+    ejecutar_con_auditoria(
+        db,
+        mutar=mutar,
+        detalle={
+            "estado_anterior": estado_anterior.value,
+            "estado_nuevo": EstadoReserva.CHECK_OUT.value,
+            "habitacion_estado_anterior": habitacion_estado_anterior.value,
+            "habitacion_estado_nuevo": habitacion_estado_nuevo.value,
+            "limpieza_anterior": limpieza_anterior.value,
+            "limpieza_nueva": EstadoLimpieza.SUCIA.value,
+        },
+        usuario_id=usuario_id,
+        accion=ACCION_CHECK_OUT_RESERVA,
+        entidad="Reserva",
+        entidad_id=reserva.id,
+    )
+
+    db.refresh(reserva)
+    db.refresh(habitacion)
+    huesped = db.get(Huesped, reserva.huesped_id)
+    lectura = _armar_lectura(reserva, huesped, habitacion)
+    return _con_resultado_economico(db, lectura)
+
+
+def extender_reserva(
+    db: Session,
+    reserva_id: int,
+    datos: ExtenderReservaRequest,
+    usuario_id: int,
+) -> ReservaRead:
+    """Extiende la estancia de una reserva en CHECK_IN.
+
+    `nuevaFechaSalida` debe ser posterior a la fecha de salida actual; se
+    revalida el solapamiento excluyendo la propia reserva y se recalcula
+    `total_estimado` = noches × `precio_noche_aplicado`, con
+    noches = nuevaFechaSalida − fecha_entrada. El precio congelado no cambia.
+
+    No es una transición de estado: la reserva debe estar en CHECK_IN y se
+    comprueba el estado directamente (TRANSICION_INVALIDA en caso contrario).
+
+    Decisiones de negocio (comportamiento deseado, no errores):
+    - No se comprueba el estado de la habitación: aunque haya pasado a
+      MANTENIMIENTO mientras el huésped estaba alojado, puede extender su
+      estancia. El huésped ya está dentro y la habitación ya le pertenece.
+    - No se comprueba que la reserva siga vigente: una reserva en CHECK_IN con
+      `fecha_salida` ya pasada (el huésped nunca hizo check-out) puede
+      extenderse a cualquier fecha futura sin límite. La única validación
+      temporal es `nueva_fecha_salida > fecha_salida`.
+    """
+    reserva = db.get(Reserva, reserva_id)
+    if reserva is None:
+        raise ReservaNoEncontradaError
+
+    # (b)-(d) Bloquear la habitacion y fijar la reserva con SELECT FOR UPDATE,
+    # con el mismo patrón y orden que las transiciones de estado.
+    habitaciones = _bloquear_habitacion_de_reserva(db, reserva)
+    habitacion = habitaciones[reserva.habitacion_id]
+
+    if reserva.estado is not EstadoReserva.CHECK_IN:
+        raise TransicionInvalidaError(reserva.estado, EstadoReserva.CHECK_IN)
+
+    # (g) Reglas propias de la extensión.
+    if datos.nueva_fecha_salida <= reserva.fecha_salida:
+        raise RangoFechasInvalidoError
+
+    if _existe_solapamiento(
+        db,
+        habitacion.id,
+        reserva.fecha_entrada,
+        datos.nueva_fecha_salida,
+        excluir_reserva_id=reserva.id,
+    ):
+        raise ReservaSolapadaError
+
+    noches = _numero_noches(reserva.fecha_entrada, datos.nueva_fecha_salida)
+    nuevo_total = _total_estimado(reserva.precio_noche_aplicado, noches)
+
+    fecha_salida_anterior = reserva.fecha_salida
+    total_anterior = reserva.total_estimado
+
+    def mutar() -> None:
+        reserva.fecha_salida = datos.nueva_fecha_salida
+        reserva.total_estimado = nuevo_total
+
+    ejecutar_con_auditoria(
+        db,
+        mutar=mutar,
+        detalle={
+            "fecha_salida_anterior": fecha_salida_anterior.isoformat(),
+            "fecha_salida_nueva": datos.nueva_fecha_salida.isoformat(),
+            "total_anterior": str(total_anterior),
+            "total_nuevo": str(nuevo_total),
+        },
+        usuario_id=usuario_id,
+        accion=ACCION_EXTENDER_RESERVA,
+        entidad="Reserva",
+        entidad_id=reserva.id,
+    )
+
+    db.refresh(reserva)
+    huesped = db.get(Huesped, reserva.huesped_id)
+    return _armar_lectura(reserva, huesped, habitacion)
